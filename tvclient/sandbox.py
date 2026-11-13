@@ -58,16 +58,6 @@ class Sandbox(ABC):
         """Executes one tool call in this sandbox and returns its result."""
         ...
 
-    async def equals(self, other: "Sandbox") -> bool:
-        """Returns whether this live sandbox's state matches other's.
-
-        Both sandboxes must be live (started). Each workload decides which
-        state counts, for example ignoring timestamps, but the result should
-        behave like equality. Comparing must not change the compared state.
-        The default raises NotImplementedError.
-        """
-        raise NotImplementedError(f"{type(self).__name__} does not implement equals")
-
     @abstractmethod
     async def stop(self) -> None:
         """Stops and deletes this sandbox."""
@@ -76,16 +66,26 @@ class Sandbox(ABC):
     async def state_digest(self) -> Optional[dict]:
         """Optional: a structured digest of this live sandbox's state (see
         correctness/tvverify/digest). Workloads that can hash their state
-        override this; the default means "not available"."""
+        override this; the default means "not available". The default
+        equals() compares two sandboxes through it."""
         return None
 
     async def equals(self, other: "Sandbox") -> bool:
         """Optional: whether this live sandbox and `other` (also live) hold the
-        same state. Only the correctness framework calls it, never the executor.
+        same state. The correctness framework and graph contraction call it,
+        never the executor.
 
-        Override it directly (e.g. diff two containers' filesystems, compare two
-        database dumps), or implement state_digest() and keep this default,
-        which compares the strict components of both digests.
+        Graph contraction merges two cached nodes when this returns True, and
+        from then on one node's snapshot and cached results serve both. So
+        report two states as equal only if no later tool call can tell them
+        apart. Each workload decides which state counts, for example ignoring
+        timestamps, but the result should behave like equality, and comparing
+        must not change the compared state.
+
+        Override it directly (e.g. diff two containers' filesystems, compare
+        two database dumps), or implement state_digest() and keep this default,
+        which compares the strict components of both digests. With neither, it
+        raises NotImplementedError, and contraction leaves the pair unmerged.
         """
         mine, theirs = await self.state_digest(), await other.state_digest()
         if mine is None or theirs is None:
