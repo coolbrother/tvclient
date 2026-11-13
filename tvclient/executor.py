@@ -11,6 +11,7 @@ from tvclient.client import FindResult, TVCacheClient
 from tvclient.sandbox import Sandbox
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator
 from tvclient.protocol import validate_embedding
+from tvclient.observer import ExecutionObserver, LookupContext
 from tvclient.snapshot_policy import (
     INITIAL_FORK_COST_SECONDS,
     SNAPSHOT_COST_MULTIPLIER,
@@ -55,6 +56,7 @@ class TvcacheToolExecutor:
         initial_fork_cost_seconds: float = INITIAL_FORK_COST_SECONDS,
         ttl: Optional[int] = None,
         embed_tool_calls: bool = False,
+        observer: Optional[ExecutionObserver] = None,
     ):
         self.client = TVCacheClient(host, port)
         self.tool_call_env_class = tool_call_env_class
@@ -63,6 +65,10 @@ class TvcacheToolExecutor:
         self.ttl = ttl
         self.embed_tool_calls = embed_tool_calls
         self._embedding_failed = False
+        self.observer = observer or ExecutionObserver()
+        self._ctx: Optional[LookupContext] = None
+        # Inserts the server refused (missing parent, or a conflicting value).
+        self.rejected_inserts = 0
         # Owns the un-checkpointed replay cost and the adaptive snapshot
         # threshold (backed by the server-side fork-cost EMA).
         self.snapshot_policy = SnapshotPolicy(
@@ -126,17 +132,22 @@ class TvcacheToolExecutor:
         history, current = tool_commands[:-1], tool_commands[-1]
         stateful_calls = [c for c in history if c.will_mutate_state()]
         path = [c.serialize() for c in stateful_calls] + [current.serialize()]
+        self._ctx = LookupContext(
+            self.task_name, self.rollout_id, self.total_calls, list(path), current
+        )
 
         cst = time.perf_counter()
         found = await self.client.find(self.task_name, path)
         cet = time.perf_counter()
 
         async with found:
+            await self.observer.on_lookup(self._ctx, found)
             if found.value is not None:
                 self.logger.debug(
                     f"CACHE HIT for task id {self.task_name} at depth {len(path)} "
                     f"in {cet - cst} seconds for rollout {self.rollout_id}"
                 )
+                await self.observer.on_return(self._ctx, found.value, "hit")
                 return found.value
 
             self.logger.debug(
@@ -147,8 +158,14 @@ class TvcacheToolExecutor:
             # sandbox cannot be reclaimed mid-fork.
             environment, resume_depth = await self._acquire_environment(found, path)
 
+        # The sandbox must not already contain the current call (see
+        # _acquire_environment); executing it again would cache a wrong value.
+        assert resume_depth <= len(path) - 1, (resume_depth, len(path))
+
         suffix_calls = stateful_calls[resume_depth:] + [current]
-        return await self._execute_and_insert(environment, path, suffix_calls, resume_depth)
+        value = await self._execute_and_insert(environment, path, suffix_calls, resume_depth)
+        await self.observer.on_return(self._ctx, value, "exec")
+        return value
 
     async def test(self, tool_call_history: List[ToolCall]) -> str:
         """Returns the (possibly cached) test result for the rollout's history.
@@ -165,21 +182,29 @@ class TvcacheToolExecutor:
     ) -> Tuple[Sandbox, int]:
         """Picks the deepest valid resume point: forked LPM sandbox, the live
         sandbox (fast-forwarded), or a fresh environment."""
+        # The last entry of tool_call_list is the current call. A sandbox that
+        # already holds `len(tool_call_list)` entries includes the current call's
+        # mutation, so it can never be used to execute it (again): re-running a
+        # stateful call on its own result caches a wrong value (bug B1). Both
+        # the live and the LPM resume points are therefore capped here.
+        max_resume_depth = len(tool_call_list) - 1
+
         live_usable = (
             self.rollout_sandbox is not None
+            and len(self.sandbox_history) <= max_resume_depth
             and tool_call_list[: len(self.sandbox_history)] == self.sandbox_history
         )
         live_depth = len(self.sandbox_history) if live_usable else 0
 
-        # A sandbox cached at the full path already includes the current call's
-        # mutation, so it can never be used to (re-)execute the current call.
         lpm_depth = 0
         if found.sandbox_id is not None:
             lpm_depth = len(found.sandbox_path)
+        lpm_usable = found.sandbox_id is not None and lpm_depth <= max_resume_depth
 
-        if found.sandbox_id is not None and lpm_depth > live_depth:
+        if lpm_usable and lpm_depth > live_depth:
             lpm_sandbox = await self._fork_environment(found.sandbox_id)
             self._replace_rollout_environment(lpm_sandbox, list(tool_call_list[:lpm_depth]))
+            await self.observer.on_resume(self._ctx, "fork", lpm_depth, lpm_sandbox.get_id())
             self.logger.debug(
                 f"[ENV]: Resuming from forked sandbox at depth {lpm_depth} "
                 f"(live sandbox depth was {live_depth}) for rollout {self.rollout_id}"
@@ -192,10 +217,14 @@ class TvcacheToolExecutor:
                     f"[ENV]: Fast-forwarding {self.rollout_sandbox.get_id()} from depth "
                     f"{live_depth} to {len(tool_call_list) - 1} for rollout {self.rollout_id}"
                 )
+            await self.observer.on_resume(
+                self._ctx, "live", live_depth, self.rollout_sandbox.get_id()
+            )
             return self.rollout_sandbox, live_depth
 
         environment = await self._fresh_environment()
         self._replace_rollout_environment(environment, [])
+        await self.observer.on_resume(self._ctx, "fresh", 0, environment.get_id())
         return environment, 0
 
     async def _fork_environment(self, parent_env_id: str) -> Sandbox:
@@ -296,17 +325,31 @@ class TvcacheToolExecutor:
             if tool_call.will_mutate_state():
                 self.sandbox_history.append(tool_call.serialize())
 
-            if value.startswith("Failed to execute"):
-                # Environment-reported failure: keep the rollout going but never cache it.
+            failed = value.startswith("Failed to execute")
+            digest = None
+            if self.observer.wants_digest(self._ctx, depth):
+                digest = await environment.state_digest()
+            await self.observer.on_executed(
+                self._ctx, depth, tool_call, value, runtime_seconds, failed, digest
+            )
+
+            if failed:
+                # Environment-reported failure: keep the rollout going but never
+                # cache the value. A stateful failure still changed the
+                # sandbox, so leave a value-less placeholder node: deeper
+                # inserts in this rollout need their parent to exist (bug B3),
+                # and a placeholder is a miss for lookups.
                 self.logger.debug(
                     f"[TOOL EXEC]: Not caching failed result at depth {depth} "
                     f"for rollout {self.rollout_id}"
                 )
                 if embedding_future is not None:
                     embedding_future.cancel()
+                if tool_call.will_mutate_state():
+                    await self._insert(list(path[:depth]), None, None, runtime_seconds)
                 last_value = value
                 continue
-            
+
             await self._update_tvcache_with_execution(
                 tool_call, environment, path, depth, value, runtime_seconds, embedding_future
             )
@@ -335,6 +378,10 @@ class TvcacheToolExecutor:
             fet = time.perf_counter()
             await self.snapshot_policy.observe_fork(fet - fst)
             sandbox_id = stored_copy.get_id()
+            snapshot_digest = None
+            if self.observer.wants_digest(self._ctx, depth):
+                snapshot_digest = await environment.state_digest()
+            await self.observer.on_snapshot(self._ctx, depth, sandbox_id, snapshot_digest)
             self.logger.debug(
                 f"[ENV]: Storing fork {sandbox_id} after {unsnapshotted_runtime:.2f} "
                 f"seconds of un-checkpointed runtime (threshold {snapshot_threshold:.2f}, "
@@ -347,14 +394,8 @@ class TvcacheToolExecutor:
         embedding = await self._await_embedding(embedding_future)
 
         ist = time.perf_counter()
-        insert_result = await self.client.insert(
-            self.task_name,
-            list(path[:depth]),
-            value,
-            sandbox_id,
-            runtime=self._runtime_ms(runtime_seconds),
-            ttl=self.ttl,
-            embedding=embedding,
+        insert_result = await self._insert(
+            list(path[:depth]), value, sandbox_id, runtime_seconds, embedding
         )
         iet = time.perf_counter()
         self.logger.debug(
@@ -398,6 +439,34 @@ class TvcacheToolExecutor:
             log(f"[EMBED]: Skipping embedding due to {error!r} for rollout {self.rollout_id}")
             return None
         return embedding
+
+    async def _insert(
+        self,
+        path: List[str],
+        value: Optional[str],
+        sandbox_id: Optional[str],
+        runtime_seconds: float,
+        embedding: Optional[List[float]] = None,
+    ):
+        """Inserts into the cache, counting and logging refusals (a missing
+        parent, or a value that conflicts with the one already cached)."""
+        insert_result = await self.client.insert(
+            self.task_name,
+            path,
+            value,
+            sandbox_id,
+            runtime=self._runtime_ms(runtime_seconds),
+            ttl=self.ttl,
+            embedding=embedding,
+        )
+        if not insert_result.value_inserted:
+            self.rejected_inserts += 1
+            self.logger.debug(
+                f"[CACHE]: Insert at depth {len(path)} was refused by the server "
+                f"for rollout {self.rollout_id}"
+            )
+        await self.observer.on_insert(self._ctx, path, value, sandbox_id, insert_result)
+        return insert_result
 
     def _replace_rollout_environment(
         self, environment: Sandbox, sandbox_history: List[str]
